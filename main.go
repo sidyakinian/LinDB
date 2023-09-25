@@ -26,6 +26,7 @@ type server struct {
 	electionTimeout time.Duration
 	electionDeadline time.Time
 	term         int
+	log 		 *ReplicatedLog
 }
 
 func newServer(node *maelstrom.Node) *server {
