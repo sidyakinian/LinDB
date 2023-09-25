@@ -15,5 +15,5 @@ make test-multi-node:
 	--bin $(GOBIN)/lin-db \
 	--time-limit 10 \
 	--rate 10 \
-	--node-count 2 \
+	--node-count 3 \
 	--concurrency 2n

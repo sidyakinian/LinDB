@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"math/rand"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -20,6 +22,63 @@ type server struct {
 	node         *maelstrom.Node
 	stateMachine *Map
 	lock         sync.Mutex
+	state 	     string 	// follower, candidate, leader
+	electionTimeout time.Duration
+	electionDeadline time.Time
+}
+
+func newServer(node *maelstrom.Node) *server {
+	log.Printf("new server is being initialized")
+	s := &server{
+		node: node,
+		stateMachine: NewMap(),
+		state: "follower",
+		electionTimeout: 2 * time.Second,
+		electionDeadline: time.Now(),
+	}
+	go s.runElectionTask()
+	return s
+}
+
+func (s *server) becomeCandidate() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.state = "candidate"
+	s.resetElectionDeadline()
+
+	log.Printf("became candidate")
+}
+
+func (s *server) becomeFollower() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.state = "follower"
+	s.resetElectionDeadline()
+	log.Printf("became follower")
+}
+
+func (s *server) resetElectionDeadline() {
+	randomDelay := time.Duration((1 + float64(rand.Intn(100)/100.0)) * float64(s.electionTimeout))
+	s.electionDeadline = time.Now().Add(randomDelay)
+}
+
+func (s *server) runElectionTask() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// s.lock.Lock() // No recursive locks in Go, avoid deadlock
+		if time.Now().After(s.electionDeadline) {
+			if s.state != "leader" {
+				s.becomeCandidate()
+			} else {
+				s.resetElectionDeadline()
+			}
+		}
+		// s.lock.Unlock()
+	}
 }
 
 type Map struct {
@@ -78,10 +137,8 @@ func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
 
 func main() {
 	node := maelstrom.NewNode()
-	s := &server{
-		node:         node,
-		stateMachine: NewMap(),
-	}
+	s := newServer(node)
+	
 	node.Handle("read", s.clientReq)
 	node.Handle("write", s.clientReq)
 	node.Handle("cas", s.clientReq)
