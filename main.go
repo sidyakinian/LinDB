@@ -85,7 +85,7 @@ func (s *server) runElectionTask() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// s.lock.Lock() // No recursive locks in Go, avoid deadlock
+		// No recursive locks in Go, avoid deadlock
 		if time.Now().After(s.electionDeadline) {
 			if s.state != "leader" {
 				s.becomeCandidate()
@@ -93,7 +93,6 @@ func (s *server) runElectionTask() {
 				s.resetElectionDeadline()
 			}
 		}
-		// s.lock.Unlock()
 	}
 }
 
