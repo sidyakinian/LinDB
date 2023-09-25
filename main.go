@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -10,16 +11,25 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+type Node struct {
+    maelstrom.Node
+}
+
 type RequestBody struct {
 	Type  string `json:"type"`
 	Key   int    `json:"key"`
 	Value int    `json:"value,omitempty"`
 	From  int    `json:"from,omitempty"`
 	To    int    `json:"to,omitempty"`
+	Term int `json:"term"`
+	VoteGranted bool `json:"vote_granted"`
+	LastLogTerm int `json:"last_log_term"`
+	LastLogIndex int `json:"last_log_index"`
+	CandidateID string `json:"candidate_id"`
 }
 
 type server struct {
-	node         *maelstrom.Node
+	node         *Node
 	stateMachine *Map
 	lock         sync.Mutex
 	state 	     string 	// follower, candidate, leader
@@ -27,9 +37,10 @@ type server struct {
 	electionDeadline time.Time
 	term         int
 	log 		 *ReplicatedLog
+	votedFor    string
 }
 
-func newServer(node *maelstrom.Node) *server {
+func newServer(node *Node) *server {
 	log.Printf("new server is being initialized")
 	s := &server{
 		node: node,
@@ -49,9 +60,10 @@ func (s *server) becomeCandidate() {
 
 	s.state = "candidate"
 	s.advanceTerm(s.term + 1)
+	s.votedFor = s.node.ID()
 	s.resetElectionDeadline()
-
 	log.Printf("became candidate for term %d", s.term)
+	s.requestVotes()
 }
 
 func (s *server) becomeFollower() {
@@ -90,6 +102,69 @@ func (s *server) advanceTerm(term int) {
 		panic("term cannot go backwards")
 	}
 	s.term = term
+	s.votedFor = ""
+}
+
+func (s *server) maybeStepDown(remote_term int) {
+	if remote_term > s.term {
+		fmt.Printf("term %d is behind %d, stepping down", s.term, remote_term)
+		s.advanceTerm(remote_term)
+		s.becomeFollower()
+	}
+}
+
+func (s *server) requestVotes() {
+	votes := map[string]struct{}{
+		s.node.ID(): {},
+	}
+	currentTerm := s.term
+
+	handlerFunc := func(msg maelstrom.Message) error {
+		var body RequestBody
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		s.maybeStepDown(body.Term)
+		if s.state == "candidate" && s.term == currentTerm && s.term == body.Term && body.VoteGranted {
+			// We have a vote for our candidacy, and we're still in the term we requested! Record the vote
+			votes[msg.Src] = struct{}{}
+			log.Printf("Have votes: %v", votes)
+		}
+		return nil
+	}
+
+	s.node.brpc(map[string]interface{}{
+		"type":           "request_vote",
+		"term":           currentTerm,
+		"candidate_id":   s.node.ID(),
+		"last_log_index": len(s.log.entries),
+		"last_log_term":  s.log.entries[len(s.log.entries)-1].Term,
+	}, handlerFunc)
+}
+
+func (s *server) becomeLeader() {
+	if s.state != "candidate" {
+		panic("cannot become leader if not a candidate")
+	}
+
+	s.state = "leader"
+	log.Printf("became leader for term %d", s.term)
+}
+
+func (n *Node) otherNodeIDs() []string {
+	otherIDs := []string{}
+	for _, id := range n.NodeIDs() {
+		if id != n.ID() {
+			otherIDs = append(otherIDs, id)
+		}
+	}
+	return otherIDs
+}
+
+func (n *Node) brpc(body map[string]any, handler maelstrom.HandlerFunc) {
+	for _, node := range n.otherNodeIDs() {
+		go n.RPC(node, body, handler)
+	}
 }
 
 type Map struct {
@@ -100,7 +175,7 @@ func NewMap() *Map {
 	return &Map{data: make(map[int]int)}
 }
 
-func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
+func (s *server) Apply(m *Map, op RequestBody, message maelstrom.Message) (*Map, map[string]interface{}) {
 	switch op.Type {
 	case "read":
 		val, exists := m.data[op.Key]
@@ -139,6 +214,31 @@ func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
 		return newMap, map[string]interface{}{
 			"type": "cas_ok",
 		}
+	case "request_vote":
+		s.maybeStepDown(op.Term)
+		grant := false
+
+		if op.Term < s.term {
+			log.Printf("Candidate term %d lower than %d, not granting vote.", op.Term, s.term)
+		} else if s.votedFor != "" {
+			log.Printf("Already voted for %s; not granting vote.", s.votedFor)
+		} else if op.LastLogTerm < s.log.entries[len(s.log.entries)-1].Term { 
+			log.Printf("Have log entries from term %d, which is newer than remote term %d; not granting vote.", s.log.entries[len(s.log.entries)-1].Term, op.LastLogTerm)
+		} else if op.LastLogTerm == s.log.entries[len(s.log.entries)-1].Term && op.LastLogIndex < len(s.log.entries) {
+			log.Printf("Our logs are both at term %d, but our log is %d and theirs is only %d long; not granting vote.", s.log.entries[len(s.log.entries)-1].Term, len(s.log.entries), op.LastLogIndex)
+		} else {
+			log.Printf("Granting vote to %s", op.CandidateID)
+			grant = true
+			s.votedFor = op.CandidateID
+			s.resetElectionDeadline() 
+		}
+	
+		// Sending the reply
+		s.node.Reply(message, map[string]interface{}{
+			"type":         "request_vote_res",
+			"term":         s.term,
+			"vote_granted": grant,
+		})
 	}
 	return m, map[string]interface{}{
 		"type":    "error",
@@ -147,12 +247,16 @@ func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
 }
 
 func main() {
-	node := maelstrom.NewNode()
-	s := newServer(node)
+	maelstromNode := maelstrom.NewNode()
+	node := Node{
+		Node: *maelstromNode,
+	}
+	s := newServer(&node)
 	
 	node.Handle("read", s.clientReq)
 	node.Handle("write", s.clientReq)
 	node.Handle("cas", s.clientReq)
+	node.Handle("request_vote", s.clientReq)
 
 	if err := node.Run(); err != nil {
 		log.Fatal(err)
@@ -166,7 +270,7 @@ func (s *server) clientReq(message maelstrom.Message) error {
 	}
 
 	s.lock.Lock()
-	newStateMachine, resp := s.stateMachine.Apply(body)
+	newStateMachine, resp := s.Apply(s.stateMachine, body, message)
 	s.stateMachine = newStateMachine
 	s.lock.Unlock()
 
