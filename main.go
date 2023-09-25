@@ -25,6 +25,7 @@ type server struct {
 	state 	     string 	// follower, candidate, leader
 	electionTimeout time.Duration
 	electionDeadline time.Time
+	term         int
 }
 
 func newServer(node *maelstrom.Node) *server {
@@ -35,6 +36,7 @@ func newServer(node *maelstrom.Node) *server {
 		state: "follower",
 		electionTimeout: 2 * time.Second,
 		electionDeadline: time.Now(),
+		term: 0,
 	}
 	go s.runElectionTask()
 	return s
@@ -45,9 +47,10 @@ func (s *server) becomeCandidate() {
 	defer s.lock.Unlock()
 
 	s.state = "candidate"
+	s.advanceTerm(s.term + 1)
 	s.resetElectionDeadline()
 
-	log.Printf("became candidate")
+	log.Printf("became candidate for term %d", s.term)
 }
 
 func (s *server) becomeFollower() {
@@ -56,7 +59,7 @@ func (s *server) becomeFollower() {
 
 	s.state = "follower"
 	s.resetElectionDeadline()
-	log.Printf("became follower")
+	log.Printf("became follower for term %d", s.term)
 }
 
 func (s *server) resetElectionDeadline() {
@@ -79,6 +82,13 @@ func (s *server) runElectionTask() {
 		}
 		// s.lock.Unlock()
 	}
+}
+
+func (s *server) advanceTerm(term int) {
+	if term < s.term {
+		panic("term cannot go backwards")
+	}
+	s.term = term
 }
 
 type Map struct {
