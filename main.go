@@ -18,19 +18,15 @@ type RequestBody struct {
 
 type server struct {
 	node         *maelstrom.Node
-	stateMachine *Map
+	state *State	// pointer because of copying over map
 	lock         sync.Mutex
 }
 
-type Map struct {
+type State struct {
 	data map[int]int
 }
 
-func NewMap() *Map {
-	return &Map{data: make(map[int]int)}
-}
-
-func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
+func (m *State) apply(op RequestBody) (*State, map[string]interface{}) {
 	switch op.Type {
 	case "read":
 		val, exists := m.data[op.Key]
@@ -45,7 +41,8 @@ func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
 			"message": "not found",
 		}
 	case "write":
-		newMap := &Map{data: make(map[int]int)}
+		// TODO: consider modifying map instead of copying
+		newMap := &State{data: make(map[int]int)}
 		for k, v := range m.data {
 			newMap.data[k] = v
 		}
@@ -61,7 +58,7 @@ func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
 				"message": "precondition failed",
 			}
 		}
-		newMap := &Map{data: make(map[int]int)}
+		newMap := &State{data: make(map[int]int)}
 		for k, v := range m.data {
 			newMap.data[k] = v
 		}
@@ -76,11 +73,25 @@ func (m *Map) Apply(op RequestBody) (*Map, map[string]interface{}) {
 	}
 }
 
+func (s *server) clientReq(message maelstrom.Message) error {
+	var body RequestBody
+	if err := json.Unmarshal(message.Body, &body); err != nil {
+		return err
+	}
+
+	s.lock.Lock()
+	newStateMachine, resp := s.state.apply(body)
+	s.state = newStateMachine
+	s.lock.Unlock()
+
+	return s.node.Reply(message, resp)
+}
+
 func main() {
 	node := maelstrom.NewNode()
 	s := &server{
 		node:         node,
-		stateMachine: NewMap(),
+		state: &State{data: make(map[int]int)},
 	}
 	node.Handle("read", s.clientReq)
 	node.Handle("write", s.clientReq)
@@ -89,18 +100,4 @@ func main() {
 	if err := node.Run(); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func (s *server) clientReq(message maelstrom.Message) error {
-	var body RequestBody
-	if err := json.Unmarshal(message.Body, &body); err != nil {
-		return err
-	}
-
-	s.lock.Lock()
-	newStateMachine, resp := s.stateMachine.Apply(body)
-	s.stateMachine = newStateMachine
-	s.lock.Unlock()
-
-	return s.node.Reply(message, resp)
 }
